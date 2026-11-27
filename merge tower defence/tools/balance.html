@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pencil Case balance bots</title>
+<style>
+  body { font: 14px/1.5 Consolas, monospace; margin: 24px; background: #1e262d; color: #e8ecea; }
+  table { border-collapse: collapse; }
+  th, td { padding: 4px 14px; text-align: right; border-bottom: 1px solid #3b4955; }
+  th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<h1>Balance bots</h1>
+<p>Each row plays full games with no drawing. Change numbers in js/data.js, then reload.</p>
+<div id="out">Running...</div>
+<script src="../js/data.js"></script>
+<script src="../js/sim.js"></script>
+<script>
+// Rank every free cell by how much path a tower there can reach.
+function rankedCells(map) {
+  const cells = [];
+  for (let c = 0; c < PC.COLS; c++) {
+    for (let r = 0; r < PC.ROWS; r++) {
+      if (!PC.isBuildable(map, c, r)) continue;
+      const cover = PC.MAPS[map].pts.filter((p) => Math.hypot(p.x - c - 0.5, p.y - r - 0.5) < 2.4).length;
+      cells.push({ c, r, cover });
+    }
+  }
+  return cells.sort((a, b) => b.cover - a.cover);
+}
+// The map everything below plays on. setMap('spiral') switches it.
+let MAP = PC.DEFAULT_MAP, CELLS = rankedCells(MAP);
+function setMap(map) {
+  MAP = map;
+  CELLS = rankedCells(map);
+}
+const coverOf = (t) => CELLS.find((k) => k.c === t.c && k.r === t.r).cover;
+const freeCell = (s) => CELLS.find((k) => !PC.towerAt(s, k.c, k.r));
+
+function mergeAll(s, canPair) {
+  for (let merged = true; merged;) {
+    merged = false;
+    for (const a of [...s.towers].sort((x, y) => x.level - y.level)) {
+      const b = s.towers.find((t) => t !== a && t.level === a.level && canPair(a, t));
+      if (!b) continue;
+      const [from, to] = coverOf(a) < coverOf(b) ? [a, b] : [b, a];
+      PC.moveTower(s, from, to.c, to.r);
+      merged = true;
+      break;
+    }
+  }
+}
+
+function buyCycle(s, items) {
+  let i = s.bought;
+  while (s.money >= PC.price(s)) {
+    const k = freeCell(s);
+    PC.buyItem(s, items[i++ % items.length], k.c, k.r);
+  }
+}
+
+// Commits to one supply, to compare how each holds up on its own.
+function only(target) {
+  const parts = PC.BASICS.filter((p) => PC.SUPPLIES[target].mask & PC.SUPPLIES[p].mask);
+  const allowed = PC.SUPPLIES[target].mask;
+  return (s) => {
+    buyCycle(s, parts);
+    // Anything that stays inside the recipe may merge, so three-part supplies can build up.
+    mergeAll(s, (a, b) => (PC.SUPPLIES[PC.combine(a.type, b.type)].mask & ~allowed) === 0);
+  };
+}
+
+// The two things that merge to make a supply.
+function partsOf(type) {
+  const p = PC.SUPPLIES[type];
+  if (p.from) return p.from;
+  const basics = PC.BASICS.filter((b) => PC.SUPPLIES[b].mask & p.mask);
+  const pair = (a, b) => PC.combine(a, b);
+  if (basics.length === 2) return basics;
+  if (basics.length === 3) return [pair(basics[0], basics[1]), basics[2]];
+  return [pair(basics[0], basics[1]), pair(basics[2], basics[3])];
+}
+
+// How many items a fresh one takes, and the level it comes out at.
+function recipeOf(type) {
+  if (PC.BASICS.includes(type)) return { items: 1, level: 1 };
+  const [a, b] = partsOf(type).map(recipeOf);
+  const level = Math.max(a.level, b.level);
+  return { items: a.items * 2 ** (level - a.level) + b.items * 2 ** (level - b.level), level: level + 1 };
+}
+
+// Makes one from scratch, levelling up the smaller part until the two can merge.
+function craft(s, type) {
+  if (PC.BASICS.includes(type)) {
+    const k = freeCell(s);
+    return PC.buyItem(s, type, k.c, k.r);
+  }
+  const [x, y] = partsOf(type);
+  let a = craft(s, x), b = craft(s, y);
+  while (a.level < b.level) a = PC.moveTower(s, craft(s, x), a.c, a.r).tower;
+  while (b.level < a.level) b = PC.moveTower(s, craft(s, y), b.c, b.r).tower;
+  return PC.moveTower(s, a, b.c, b.r).tower;
+}
+
+// Crafts as many as it can afford, then merges matching ones up.
+function buildAdvanced(target) {
+  const { items } = recipeOf(target);
+  const unitCost = (s) => Array.from({ length: items }, (_, i) => PC.priceAt(s, i)).reduce((a, b) => a + b);
+  return (s) => {
+    // Big recipes take a while to afford, so hold the early waves with cheap supplies first.
+    if (s.wave < 6) buyCycle(s, ['ruler', 'pencil']);
+    else while (s.money >= unitCost(s)) craft(s, target);
+    mergeAll(s, (a, b) => a.type === b.type);
+  };
+}
+
+// One step of building `type` that can stop when the money runs out and carry on next
+// wave, reusing the half-built parts it left on the board. Returns null if it stopped.
+function craftStep(s, type, used) {
+  const need = recipeOf(type).level;
+  const have = s.towers.find((t) => t.type === type && t.level === need && !used.has(t));
+  if (have) {
+    used.add(have);
+    return have;
+  }
+  if (PC.BASICS.includes(type)) {
+    const k = freeCell(s);
+    if (!k || s.money < PC.price(s)) return null;
+    const t = PC.buyItem(s, type, k.c, k.r);
+    used.add(t);
+    return t;
+  }
+  const [x, y] = partsOf(type);
+  const a = craftStep(s, x, used);
+  if (!a) return null;
+  const b = craftStep(s, y, used);
+  if (!b || a.level !== b.level) return null;
+  used.delete(a);
+  used.delete(b);
+  const made = PC.moveTower(s, a, b.c, b.r).tower;
+  used.add(made);
+  return made;
+}
+
+// The strongest player found so far: spends the starting money on cheap supplies, then
+// builds `target` piece by piece from wave 1 and merges the copies up. 'pro geometry'
+// is the yardstick Graduate School is tuned against.
+function pro(target, opener = ['ruler', 'pencil']) {
+  return (s) => {
+    if (s.wave === 0) buyCycle(s, opener);
+    else {
+      for (let i = 0; i < 12; i++) {
+        if (!craftStep(s, target, new Set(s.towers.filter((t) => t.type === target)))) break;
+      }
+    }
+    mergeAll(s, (a, b) => a.type === b.type && (a.type === target || opener.includes(a.type)));
+  };
+}
+
+// Holds the early waves with `first`, then from wave `switchAt` puts its money into
+// `later` (usually a legendary) while still merging both up. A player beat Graduate
+// School without losing a star this way, holding early and finishing with a Laser Cutter.
+function proThen(first, later, switchAt = 20) {
+  const early = pro(first);
+  return (s) => {
+    if (s.wave < switchAt) return early(s);
+    for (let i = 0; i < 12; i++) {
+      if (!craftStep(s, later, new Set(s.towers.filter((t) => t.type === later)))) break;
+    }
+    mergeAll(s, (a, b) => a.type === b.type && (a.type === first || a.type === later));
+  };
+}
+
+const BOTS = {
+  'pro geometry': pro('geometry'),
+  'pro laser': pro('laser'),
+  'geometry then laser cutter': proThen('geometry', 'lasercutter'),
+  // Never merges. Should fall well short: merging has to matter.
+  'no merging': (s) => {
+    let i = 0;
+    while (s.money >= PC.price(s) && freeCell(s)) {
+      const k = freeCell(s);
+      PC.buyItem(s, PC.BASICS[i++ % PC.BASICS.length], k.c, k.r);
+    }
+  },
+  ...Object.fromEntries(Object.keys(PC.SUPPLIES).filter((k) => !PC.SUPPLIES[k].from && PC.SUPPLIES[k].rate).map((k) => ['only ' + k, only(k)])),
+  ...Object.fromEntries(Object.keys(PC.SUPPLIES).filter((k) => PC.SUPPLIES[k].from).map((k) => ['build ' + k, buildAdvanced(k)])),
+  // Merges anything with anything, so it ends up nearly all pencil cases.
+  'merge everything': (s) => {
+    buyCycle(s, PC.BASICS);
+    mergeAll(s, () => true);
+  },
+  // Thoughtful player: keeps compass, tape and highlighter side by side.
+  'planned mix': (s) => {
+    buyCycle(s, ['pencil', 'glue', 'ruler']);
+    mergeAll(s, (a, b) => PC.SUPPLIES[PC.combine(a.type, b.type)].mask.toString(2).replace(/0/g, '').length < 3);
+  },
+  // Mixes across all four basics but stops at pairs, for a wide spread of supplies.
+  'wide mix': (s) => {
+    buyCycle(s, PC.BASICS);
+    mergeAll(s, (a, b) => PC.SUPPLIES[PC.combine(a.type, b.type)].mask.toString(2).replace(/0/g, '').length < 3);
+  },
+  // Highlighters with a sharpener kept beside the best one. Compare with 'only highlighter'.
+  'sharpened highlighters': (s) => {
+    const want = s.wave >= 8 ? 1 + Math.floor((s.wave - 8) / 8) : 0;
+    const have = s.towers.filter((t) => t.st.aura).reduce((sum, t) => sum + 2 ** (t.level - 3), 0);
+    const fourItems = [0, 1, 2, 3].reduce((sum, i) => sum + PC.priceAt(s, i), 0);
+    if (have < want) {
+      if (s.money < fourItems) return;
+      const pair = (a, b) => {
+        const k = freeCell(s);
+        PC.buyItem(s, a, k.c, k.r);
+        return PC.buyItem(s, b, k.c, k.r);
+      };
+      const x = pair('pencil', 'eraser'), y = pair('glue', 'eraser');
+      PC.moveTower(s, x, y.c, y.r);
+    }
+    buyCycle(s, ['pencil', 'glue']);
+    mergeAll(s, (a, b) => (a.st.aura || b.st.aura ? a.st.aura && b.st.aura : PC.combine(a.type, b.type) === 'highlighter'));
+    const best = (list) => list.sort((a, b) => b.level - a.level)[0];
+    const top = best(s.towers.filter((t) => t.type === 'highlighter'));
+    const sharp = best(s.towers.filter((t) => t.st.aura));
+    if (top && sharp && Math.hypot(sharp.c - top.c, sharp.r - top.r) > 1.5) {
+      const gap = (k) => Math.hypot(k.c - top.c, k.r - top.r);
+      const spot = CELLS.filter((k) => !PC.towerAt(s, k.c, k.r)).sort((a, b) => gap(a) - gap(b))[0];
+      PC.moveTower(s, sharp, spot.c, spot.r);
+    }
+  },
+  // Stand-in for a first-time player: random spots, keeps 30% of its money unspent,
+  // and usually only merges matching supplies.
+  casual: (s) => {
+    const budget = s.money * 0.7;
+    let spent = 0;
+    while (s.money >= PC.price(s) && spent + PC.price(s) <= budget) {
+      const free = CELLS.filter((k) => !PC.towerAt(s, k.c, k.r)).slice(0, 40);
+      const k = free[(s.rng() * free.length) | 0];
+      spent += PC.price(s);
+      PC.buyItem(s, PC.BASICS[(s.rng() * PC.BASICS.length) | 0], k.c, k.r);
+    }
+    mergeAll(s, (a, b) => a.type === b.type || s.rng() < 0.3);
+  },
+};
+
+function play(bot, seed, difficulty) {
+  const s = PC.newGame(seed, difficulty, MAP);
+  while (s.phase !== 'over' && s.wave < PC.FINAL_WAVE) {
+    bot(s);
+    PC.sendWave(s);
+    while (s.phase === 'wave') {
+      PC.step(s, 1 / 30);
+      s.fx.length = 0;
+    }
+  }
+  const types = {};
+  for (const t of s.towers) types[t.type + t.level] = (types[t.type + t.level] || 0) + 1;
+  return { wave: s.wave, lives: s.lives, won: s.phase !== 'over', towers: s.towers.length, top: Math.max(...s.towers.map((t) => t.level)) };
+}
+
+// Late-game check for the hardest schools, since a good player outplays every bot above. Killing
+// everything at Graduate School earns about $94,000 by wave 50, which buys 190 supplies, or
+// about 220 with an Abacus and a Calculator. A level L supply is 2 ** (L - 1) of them, so these
+// are the boards a player could really own by each wave, built around supply `k`.
+const BUDGET = {
+  20: (k) => [[k, 6], [k, 5], ['geometry', 4], ['calculator', 3]],
+  30: (k) => [[k, 7], [k, 6], ['calculator', 3]],
+  40: (k) => [[k, 8], ['geometry', 5]],
+  50: (k) => [[k, 8], [k, 7], ['geometry', 5], ['principal', 4], ['calculator', 4]],
+};
+// High School and College pay far less: about 110 and 92 supplies by wave 50.
+const SCHOOL_BUDGET = {
+  hard: { 20: (k) => [[k, 5], [k, 4], [k, 3]], 30: (k) => [[k, 6], [k, 5]], 40: (k) => [[k, 7], [k, 5]], 50: (k) => [[k, 7], [k, 6], ['calculator', 3]] },
+  expert: { 20: (k) => [[k, 5], [k, 4]], 30: (k) => [[k, 6], [k, 4]], 40: (k) => [[k, 7]], 50: (k) => [[k, 7], [k, 5], ['calculator', 3]] },
+};
+const LEGENDARIES = Object.keys(PC.SUPPLIES).filter((k) => PC.SUPPLIES[k].legendary && !PC.SUPPLIES[k].mythic && PC.SUPPLIES[k].dmg);
+const MYTHICS = Object.keys(PC.SUPPLIES).filter((k) => PC.SUPPLIES[k].mythic);
+
+// Places the board a player could own by wave `by`, starts at wave `from` with no more buying,
+// and returns the wave it falls on. stage('artroom', 50, 42, 'impossible') is the wave 50 check.
+// At Graduate School, legendaries should fall on or just past 50. At the Doctorate, only
+// mythics should get past it.
+function stage(k, by, from, school, seed = 1, cap = 56) {
+  const s = PC.newGame(seed, school, MAP);
+  const towers = (SCHOOL_BUDGET[school] || BUDGET)[by](k).map(([type, level], i) => ({ type, level, c: CELLS[i].c, r: CELLS[i].r, spent: 0 }));
+  s.towers = PC.load({ difficulty: school, wave: from, lives: s.lives, money: 0, bought: 0, stats: s.stats, towers }).towers;
+  s.wave = from;
+  s.money = 0;
+  while (s.phase === 'build' && s.wave < cap) {
+    PC.sendWave(s);
+    for (let n = 0; s.phase === 'wave' && n < 30 * 300; n++) {
+      PC.step(s, 1 / 30);
+      s.fx.length = 0;
+    }
+  }
+  return s.phase === 'over' ? s.wave : cap + '+';
+}
+
+// The same with any board placed at wave 30 (61 = never falls). ELITE is 592 supplies, far more
+// than a player can afford. Tuning to it once made these schools all but unwinnable.
+const ELITE =[['lasercutter', 9], ['lasercutter', 8], ['geometry', 7], ['principal', 7], ['desk', 6], ['abacus', 6], ['calculator', 5]];
+const bestBoards = (seed = 1) => Object.keys(PC.SUPPLIES).filter((k) => PC.SUPPLIES[k].legendary && !PC.SUPPLIES[k].mythic && PC.SUPPLIES[k].dmg)
+  .map((k) => [k, holdOut([[k, 9], [k, 8], ...ELITE.slice(2)], seed)]).sort((a, b) => b[1] - a[1]);
+function holdOut(board, seed = 1, school = 'impossible') {
+  const s = PC.newGame(seed, school, MAP);
+  s.wave = 30;
+  const towers = board.map(([type, level], i) => ({ type, level, c: CELLS[i].c, r: CELLS[i].r, spent: 0 }));
+  s.towers = PC.load({ difficulty: school, wave: 30, lives: s.lives, money: 0, bought: 0, stats: s.stats, towers }).towers;
+  while (s.phase !== 'over' && s.wave <= 60) {
+    PC.sendWave(s);
+    while (s.phase === 'wave') {
+      PC.step(s, 1 / 30);
+      s.fx.length = 0;
+    }
+  }
+  return s.phase === 'over' ? s.wave : 61;
+}
+
+function runAll(games = 8) {
+  return Object.entries(BOTS).map(([name, bot]) => {
+    const runs = Array.from({ length: games }, (_, i) => play(bot, i + 1));
+    const avg = (f) => (runs.reduce((n, r) => n + f(r), 0) / runs.length).toFixed(1);
+    return {
+      name, wave: avg((r) => r.wave), wins: runs.filter((r) => r.won).length + '/' + games,
+      lives: avg((r) => r.lives), towers: avg((r) => r.towers), top: avg((r) => r.top),
+    };
+  });
+}
+
+// A quick way to compare supplies of the same tier: three copies of one supply, no money
+// and endless stars on Middle School. Reports the first wave anything gets through and how
+// many stars leak by wave 50, fewest first. The wave a game is lost on is too coarse for
+// this, since nearly every supply falls to one of the bosses on waves 30, 40 or 50.
+// Run powerTest() in the console; level 5 suits advanced fusions, 3 suits legendaries.
+function power(type, seed = 1, level = 5) {
+  const s = PC.newGame(seed, 'normal', MAP);
+  const towers = [0, 1, 2].map((i) => ({ type, level, c: CELLS[i].c, r: CELLS[i].r, spent: 0 }));
+  s.towers = PC.load({ difficulty: 'normal', wave: 0, lives: 0, money: 0, bought: 0, stats: s.stats, towers }).towers;
+  s.lives = 1e9;
+  s.money = 0;
+  let first = 51;
+  while (s.wave < 50 && s.phase === 'build') {
+    const before = s.lives;
+    PC.sendWave(s);
+    for (let n = 0; s.phase === 'wave' && n < 30 * 400; n++) {
+      PC.step(s, 1 / 30);
+      s.fx.length = 0;
+    }
+    if (s.lives < before) first = Math.min(first, s.wave);
+  }
+  return { first, leaked: 1e9 - s.lives };
+}
+function powerTest(filter = (p) => p.from && !p.legendary && p.rate, level = 5, seeds = 2) {
+  return Object.keys(PC.SUPPLIES).filter((k) => filter(PC.SUPPLIES[k])).map((k) => {
+    const runs = Array.from({ length: seeds }, (_, i) => power(k, i + 1, level));
+    const avg = (f) => Math.round(runs.reduce((n, r) => n + f(r), 0) / seeds);
+    return `${k}: first leak ${avg((r) => r.first)}, ${avg((r) => r.leaked)} leaked`;
+  }).sort((a, b) => Number(a.split(', ')[1].split(' ')[0]) - Number(b.split(', ')[1].split(' ')[0]));
+}
+
+// How hard a map is: the stars that leak by wave 50 on Middle School, added up over supplies
+// that each sit by the path, so it measures the path and not one lucky supply. Each map's
+// `hp` in data.js is set so this comes out close to Homeroom's. Run mapParity() in the console.
+const PARITY = ['geometry', 'projector', 'crayonbox', 'ringbinder', 'whiteboard', 'tuningfork', 'megaphone', 'globe'];
+function mapLeak(map, hp = PC.MAPS[map].hp) {
+  const keep = MAP, was = PC.MAPS[map].hp;
+  setMap(map);
+  PC.MAPS[map].hp = hp;
+  const total = PARITY.reduce((n, k) => n + power(k, 1, 5).leaked, 0);
+  PC.MAPS[map].hp = was;
+  setMap(keep);
+  return total;
+}
+const mapParity = () => Object.keys(PC.MAPS).map((m) => `${m}: hp ${PC.MAPS[m].hp}, ${mapLeak(m)} leaked`).join('\n');
+
+// With over a hundred supplies the full run takes minutes, so it waits for ?run in the URL.
+if (location.search.includes('run')) {
+  const results = runAll();
+  window.results = results;
+  document.getElementById('out').innerHTML =
+    '<table><tr><th>Bot</th><th>Avg wave</th><th>Wins</th><th>Avg lives</th><th>Towers</th><th>Top level</th></tr>' +
+    results.map((r) => `<tr><td>${r.name}</td><td>${r.wave}</td><td>${r.wins}</td><td>${r.lives}</td><td>${r.towers}</td><td>${r.top}</td></tr>`).join('') +
+    '</table>';
+} else {
+  document.getElementById('out').textContent = 'Add ?run to the address to play every bot, or use powerTest() and holdOut(ELITE) in the console.';
+}
+</script>
+</body>
+</html>
